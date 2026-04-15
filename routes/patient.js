@@ -2,53 +2,75 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const { createClient } = require('@supabase/supabase-js');
+const { v4: uuidv4 } = require('uuid'); // To generate unique IDs
 
-// Use memory storage to handle file buffers
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Initialize Gemini
+// Initialize Supabase
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_KEY
+);
+
+// Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 router.post('/process-report', upload.single('report'), async (req, res) => {
     try {
-        // 1. Check if file exists
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: "No file uploaded" });
-        }
+        if (!req.file) return res.status(400).json({ error: "File missing" });
 
-        // 2. Initialize Model
+        // --- STEP 1: DE-IDENTIFICATION ---
+        // Create a unique Patient ID (e.g., ALLVI-XXXX)
+        const shortId = Math.floor(1000 + Math.random() * 9000); 
+        const patientId = `ALLVI-${shortId}`;
+
+        // --- STEP 2: AI PARSING ---
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = `
+            Extract these specific biomarkers from the lab report: 
+            test_date, tsh, free_t3, free_t4, anti_tpo, ferritin, vit_d. 
+            Return ONLY a valid JSON object. Use null for missing values.
+        `;
 
-        // 3. Prepare the data for Gemini
-        const prompt = "Extract biomarkers as JSON: test_date, tsh, vit_d, ferritin. Return ONLY valid JSON.";
-        const imagePart = {
-            inlineData: {
-                data: req.file.buffer.toString("base64"),
-                mimeType: req.file.mimetype
-            }
-        };
+        const result = await model.generateContent([
+            prompt,
+            {
+                inlineData: {
+                    data: req.file.buffer.toString("base64"),
+                    mimeType: req.file.mimetype,
+                },
+            },
+        ]);
 
-        // 4. Generate Content
-        const result = await model.generateContent([prompt, imagePart]);
-        const response = await result.response;
-        const text = response.text();
-
-        // 5. Clean and Parse JSON
-        // Sometimes Gemini wraps JSON in ```json ... ``` blocks
+        const text = result.response.text();
         const cleanJson = text.replace(/```json|```/g, "").trim();
         const parsedData = JSON.parse(cleanJson);
 
-        res.status(200).json({ success: true, parsedData });
+        // --- STEP 3: DATABASE STORAGE (Supabase) ---
+        // We store ONLY the Patient ID and the clinical data
+        const { data, error } = await supabase
+            .from('lab_results') // Ensure this table exists in Supabase
+            .insert([
+                { 
+                    patient_id: patientId, 
+                    ...parsedData,
+                    created_at: new Date() 
+                }
+            ]);
+
+        if (error) throw error;
+
+        // --- STEP 4: RESPONSE ---
+        res.status(200).json({ 
+            success: true, 
+            patientId: patientId, // Return this so the user knows their ID
+            data: parsedData 
+        });
 
     } catch (err) {
-        // This log will appear in your Render "Logs" tab
-        console.error("DETAILED SERVER ERROR:", err);
-        
-        res.status(500).json({ 
-            success: false, 
-            error: "Internal Server Error",
-            message: err.message 
-        });
+        console.error("Backend Error:", err);
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
