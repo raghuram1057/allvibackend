@@ -93,4 +93,42 @@ router.post('/confirm-results', async (req, res) => {
     }
 });
 
+
+
+// --- GET DASHBOARD DATA ---
+router.get('/dashboard/:patientId', async (req, res) => {
+    try {
+        const { patientId } = req.params;
+        console.log("📊 Fetching dashboard for:", patientId);
+
+        // Fetch Lab Results
+        const { data: labs, error: labErr } = await supabase
+            .from('lab_results')
+            .select('*')
+            .eq('patient_id', patientId)
+            .order('test_date', { ascending: true });
+
+        if (labErr) throw labErr;
+
+        // Fetch Symptom Data - Added a fallback empty array if table doesn't exist
+        let symptoms = [];
+        try {
+            const { data, error: sympErr } = await supabase
+                .from('symptoms')
+                .select('*')
+                .eq('patient_id', patientId)
+                .order('date', { ascending: true });
+            
+            if (!sympErr) symptoms = data;
+        } catch (e) {
+            console.log("⚠️ Symptoms table might be missing, skipping...");
+        }
+
+        res.status(200).json({ success: true, labs: labs || [], symptoms: symptoms || [] });
+    } catch (err) {
+        console.error("❌ DASHBOARD DATA ERROR:", err.message);
+        res.status(500).json({ success: false, details: err.message });
+    }
+});
+
 module.exports = router;
