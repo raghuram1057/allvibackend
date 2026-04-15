@@ -1,82 +1,73 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require('@supabase/supabase-js');
 
-// Initialize Supabase
+// Config
+const upload = multer({ storage: multer.memoryStorage() });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-/**
- * @route   POST /api/patient/onboard
- * @desc    Handles de-identification and stores parsed lab results
- */
-router.post('/onboard', async (req, res) => {
-    console.log("📥 Processing Lab Report Data...");
-    
-    const { labData } = req.body;
-    let finalAllviId = labData.existingId; // Check if user provided an ID
+router.post('/process-report', upload.single('report'), async (req, res) => {
+    const { existingId } = req.body; // Sent from frontend
+    let finalAllviId = existingId;
 
     try {
-        // --- STEP 1: IDENTITY MANAGEMENT ---
+        if (!req.file) throw new Error("No file uploaded");
+
+        // --- STEP 1: GEMINI AI PARSING ---
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = `
+            Analyze this lab report. Extract: test_date, tsh, free_t3, free_t4, anti_tpo, ferritin, vit_d.
+            Return ONLY a raw JSON object. Use null for missing values. 
+            Format: {"test_date": "YYYY-MM-DD", "tsh": 0.0, ...}
+        `;
+
+        const result = await model.generateContent([
+            prompt,
+            { inlineData: { data: req.file.buffer.toString("base64"), mimeType: req.file.mimetype } }
+        ]);
+
+        // Clean the AI response (remove markdown if any)
+        const cleanJson = result.response.text().replace(/```json|```/g, "").trim();
+        const parsedData = JSON.parse(cleanJson);
+
+        // --- STEP 2: IDENTITY LOGIC (Create or Verify) ---
         if (!finalAllviId) {
-            // New User: Generate a fresh de-identified ID
+            // New User
             finalAllviId = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
-            
-            const { error: pError } = await supabase
-                .from('patients')
-                .insert([{ allvi_id: finalAllviId }]);
-
-            if (pError) throw new Error("Failed to create new patient ID: " + pError.message);
-            console.log(`✅ New Patient Created: ${finalAllviId}`);
+            await supabase.from('patients').insert([{ allvi_id: finalAllviId }]);
         } else {
-            // Returning User: Verify the ID exists in the database
-            const { data: existingPatient, error: fetchError } = await supabase
-                .from('patients')
-                .select('allvi_id')
-                .eq('allvi_id', finalAllviId)
-                .single();
-
-            if (fetchError || !existingPatient) {
-                return res.status(404).json({ 
-                    success: false, 
-                    error: "Provided ALLVI-ID not found. Please check the ID or leave blank for a new one." 
-                });
-            }
-            console.log(`🔄 Returning Patient Verified: ${finalAllviId}`);
+            // Returning User: Verify ID exists
+            const { data } = await supabase.from('patients').select('allvi_id').eq('allvi_id', finalAllviId).single();
+            if (!data) return res.status(404).json({ error: "ALLVI-ID not found" });
         }
 
-        // --- STEP 2: STORE PARSED LAB RESULTS ---
-        const formattedData = {
+        // --- STEP 3: STORE IN SUPABASE ---
+        const { error: lError } = await supabase.from('lab_results').insert([{
             patient_id: finalAllviId,
-            test_date: labData.test_date || new Date().toISOString().split('T')[0],
-            tsh: parseFloat(labData.tsh) || null,
-            free_t3: parseFloat(labData.free_t3) || null,
-            free_t4: parseFloat(labData.free_t4) || null,
-            ferritin: parseFloat(labData.ferritin) || null,
-            vit_d: parseFloat(labData.vit_d) || null,
-            anti_tpo: parseFloat(labData.anti_tpo) || null // Added as per your Phase 1 list
-        };
+            test_date: parsedData.test_date || new Date().toISOString().split('T')[0],
+            tsh: parseFloat(parsedData.tsh) || null,
+            free_t3: parseFloat(parsedData.free_t3) || null,
+            free_t4: parseFloat(parsedData.free_t4) || null,
+            ferritin: parseFloat(parsedData.ferritin) || null,
+            vit_d: parseFloat(parsedData.vit_d) || null,
+            anti_tpo: parseFloat(parsedData.anti_tpo) || null
+        }]);
 
-        const { error: lError } = await supabase
-            .from('lab_results')
-            .insert([formattedData]);
+        if (lError) throw lError;
 
-        if (lError) throw new Error("Failed to store lab data: " + lError.message);
-        
-        console.log("✅ Lab results successfully linked to ID");
-
-        // --- STEP 3: SUCCESS RESPONSE ---
-        res.status(200).json({ 
-            success: true, 
+        // Return the parsed data for the Review Screen
+        res.status(200).json({
+            success: true,
             allvi_id: finalAllviId,
-            message: "Data processed and stored successfully."
+            parsedData: parsedData
         });
 
     } catch (err) {
-        console.error("❌ Server Process Error:", err.message);
-        res.status(500).json({ 
-            success: false, 
-            error: err.message 
-        });
+        console.error(err);
+        res.status(500).json({ error: "AI Parsing or Database error: " + err.message });
     }
 });
 
