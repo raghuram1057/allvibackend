@@ -10,44 +10,48 @@ const upload = multer({ storage: multer.memoryStorage() });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Initialize Gemini Model (April 2026 stable config)
+// 2. Initialize Gemini Model
 const model = genAI.getGenerativeModel(
-    { model: "gemini-3-flash-preview" }, 
+    { model: "gemini-3-flash-preview" },
     { apiVersion: "v1beta" }
 );
 
-// --- Helper Function to Validate Date ---
+// Helper Function to Validate Date
 const isValidDate = (dateString) => {
     const regEx = /^\d{4}-\d{2}-\d{2}$/;
-    if(!dateString || !dateString.match(regEx)) return false; // Invalid format
+    if (!dateString || !dateString.match(regEx)) return false;
     const d = new Date(dateString);
-    return d instanceof Date && !isNaN(d.getTime()); // Check if it's a real date
+    return d instanceof Date && !isNaN(d.getTime());
 };
 
+// --- ROUTE: PROCESS REPORT ---
 router.post('/process-report', upload.single('report'), async (req, res) => {
     let finalAllviId = req.body.existingId;
-    if (!finalAllviId || finalAllviId === "undefined" || finalAllviId === "null") {
-        finalAllviId = null;
-    }
+    const userAge = req.body.age;
+    const userGender = req.body.gender;
 
     try {
         if (!req.file) throw new Error("No file uploaded");
 
-        // 1. UPDATED PROMPT: Requesting all Phase 2 biomarkers
+        // 1. IMPROVED PROMPT: Forces the AI to find the markers even if hidden
         const prompt = `
-            Extract biomarkers from this lab report. 
-            Return ONLY raw JSON. No markdown backticks.
-            Include these specific keys: 
+            Analyze this medical lab report. 
+            Step 1: Locate TSH, Free T3, Free T4, Vitamin D, Ferritin, and Anti-TPO.
+            Step 2: Return a raw JSON object. NO MARKDOWN.
+            
+            Format:
             {
-              "test_date": "YYYY-MM-DD", 
-              "tsh": number, 
-              "free_t3": number, 
-              "free_t4": number, 
-              "vit_d": number, 
-              "ferritin": number,
-              "anti_tpo": number
+              "test_date": "YYYY-MM-DD",
+              "biomarkers": [
+                { "name": "tsh", "value": 1.2 },
+                { "name": "vit_d", "value": 30.5 },
+                { "name": "ferritin", "value": 50 },
+                { "name": "free_t3", "value": 3.2 },
+                { "name": "free_t4", "value": 1.1 },
+                { "name": "anti_tpo", "value": 10 }
+              ]
             }
-            If a value is missing or not found, return null for that key.
+            If a marker is missing, exclude it from the array.
         `;
 
         const result = await model.generateContent([
@@ -56,43 +60,30 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
         ]);
 
         const text = result.response.text();
+        // Robust cleaning of the AI response
         const cleanJson = text.replace(/```json|```/g, "").trim();
         const parsedData = JSON.parse(cleanJson);
 
-        // 2. DATE VALIDATION: Fallback to today if extraction fails
-        let reportDate = parsedData.test_date;
-        const isValidDate = (d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(new Date(d).getTime());
-        
-        if (!isValidDate(reportDate)) {
-            reportDate = new Date().toISOString().split('T')[0]; 
-            console.log("⚠️ Valid date not found. Using today:", reportDate);
-        }
+        // Date Check
+        let reportDate = parsedData.test_date || new Date().toISOString().split('T')[0];
 
-        // 3. IDENTITY MANAGEMENT
-        if (!finalAllviId) {
+        // 2. IDENTITY MANAGEMENT
+        if (!finalAllviId || finalAllviId === "null") {
             finalAllviId = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
-            const { error: pError } = await supabase.from('patients').insert([{ allvi_id: finalAllviId }]);
-            if (pError) throw pError;
+            await supabase.from('patients').insert([{ 
+                allvi_id: finalAllviId, 
+                age: parseInt(userAge), 
+                gender: userGender 
+            }]);
         }
 
-        // 4. DATABASE INSERTION: mapping all extracted fields
-        const { error: dbError } = await supabase.from('lab_results').insert([{
-            patient_id: finalAllviId,
-            test_date: reportDate,
-            tsh: parseFloat(parsedData.tsh) || null,
-            free_t3: parseFloat(parsedData.free_t3) || null,
-            free_t4: parseFloat(parsedData.free_t4) || null,
-            vit_d: parseFloat(parsedData.vit_d) || null,
-            ferritin: parseFloat(parsedData.ferritin) || null,
-            anti_tpo: parseFloat(parsedData.anti_tpo) || null
-        }]);
-
-        if (dbError) throw dbError;
+        // 3. LOGGING FOR DEBUGGING (Watch your terminal!)
+        console.log("Extracted Markers:", parsedData.biomarkers);
 
         res.status(200).json({ 
             success: true, 
             allvi_id: finalAllviId, 
-            parsedData: { ...parsedData, test_date: reportDate } 
+            parsedData: parsedData // Ensure this object has the 'biomarkers' key
         });
 
     } catch (err) {
@@ -100,20 +91,22 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
         res.status(500).json({ success: false, details: err.message });
     }
 });
-
+// --- ROUTE: CONFIRM RESULTS ---
 router.post('/confirm-results', async (req, res) => {
     try {
         const { patientId, biomarkers } = req.body;
-        
-        // FIX: Fallback for manual confirmation too
-        const finalDate = isValidDate(biomarkers.test_date) 
-            ? biomarkers.test_date 
+
+        const finalDate = isValidDate(biomarkers.test_date)
+            ? biomarkers.test_date
             : new Date().toISOString().split('T')[0];
 
         const { error } = await supabase.from('lab_results').insert([{
             patient_id: patientId,
             test_date: finalDate,
             tsh: parseFloat(biomarkers.tsh) || null,
+            free_t3: parseFloat(biomarkers.free_t3) || null,
+            free_t4: parseFloat(biomarkers.free_t4) || null,
+            anti_tpo: parseFloat(biomarkers.anti_tpo) || null,
             vit_d: parseFloat(biomarkers.vit_d) || null,
             ferritin: parseFloat(biomarkers.ferritin) || null
         }]);
@@ -128,13 +121,26 @@ router.post('/confirm-results', async (req, res) => {
 
 
 
-// --- GET DASHBOARD DATA ---
+// --- UPDATED GET DASHBOARD DATA ---
 router.get('/dashboard/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
-        console.log("📊 Fetching dashboard for:", patientId);
+        console.log("📊 Fetching clinical profile for:", patientId);
 
-        // Fetch Lab Results
+        // 1. NEW: Fetch Patient Demographics (Age and Gender)
+        // We use .single() because we expect exactly one record for this ID
+        const { data: patient, error: pErr } = await supabase
+            .from('patients')
+            .select('age, gender')
+            .eq('allvi_id', patientId)
+            .single();
+
+        if (pErr) {
+            console.error("⚠️ Demographics not found for this ID:", pErr.message);
+            // We don't throw an error here so the charts can still load even if age is missing
+        }
+
+        // 2. Fetch Lab Results
         const { data: labs, error: labErr } = await supabase
             .from('lab_results')
             .select('*')
@@ -143,27 +149,34 @@ router.get('/dashboard/:patientId', async (req, res) => {
 
         if (labErr) throw labErr;
 
-        // Fetch Symptom Data - Added a fallback empty array if table doesn't exist
+        // 3. Fetch Symptom Data
         let symptoms = [];
         try {
-            const { data, error: sympErr } = await supabase
+            const { data: sympData, error: sympErr } = await supabase
                 .from('symptoms')
                 .select('*')
                 .eq('patient_id', patientId)
                 .order('date', { ascending: true });
             
-            if (!sympErr) symptoms = data;
+            if (!sympErr) symptoms = sympData;
         } catch (e) {
-            console.log("⚠️ Symptoms table might be missing, skipping...");
+            console.log("⚠️ Symptoms table check skipped...");
         }
 
-        res.status(200).json({ success: true, labs: labs || [], symptoms: symptoms || [] });
+        // 4. COMBINED RESPONSE: Sending everything the frontend needs
+        res.status(200).json({ 
+            success: true, 
+            age: patient?.age || '—', 
+            gender: patient?.gender || '—', 
+            labs: labs || [], 
+            symptoms: symptoms || [] 
+        });
+
     } catch (err) {
         console.error("❌ DASHBOARD DATA ERROR:", err.message);
         res.status(500).json({ success: false, details: err.message });
     }
 });
-
 router.get('/insights/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
@@ -221,8 +234,8 @@ router.get('/admin/patients', async (req, res) => {
         const formattedPatients = patients.map(p => ({
             id: p.allvi_id,
             joined: p.created_at,
-            lastActivity: p.lab_results?.length > 0 
-                ? p.lab_results.sort((a,b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date 
+            lastActivity: p.lab_results?.length > 0
+                ? p.lab_results.sort((a, b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date
                 : 'No reports yet'
         }));
 
@@ -231,4 +244,76 @@ router.get('/admin/patients', async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
+// --- ADMIN: DELETE PATIENT AND ALL DATA ---
+router.delete('/admin/patients/:patientId', async (req, res) => {
+    try {
+        const { patientId } = req.params;
+
+        // Deleting from the 'patients' table triggers a cascade delete
+        // for 'lab_results' and 'symptoms' in Supabase.
+        const { error } = await supabase
+            .from('patients')
+            .delete()
+            .eq('allvi_id', patientId);
+
+        if (error) throw error;
+
+        res.status(200).json({
+            success: true,
+            message: `Patient ${patientId} and all associated records deleted.`
+        });
+    } catch (err) {
+        console.error("❌ DELETE ERROR:", err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// --- ROUTE: IMPORT SYMPTOMS (CSV Tally Data) ---
+router.post('/import-symptoms', async (req, res) => {
+    try {
+        const { patientId, symptoms } = req.body;
+
+        if (!patientId || !Array.isArray(symptoms)) {
+            throw new Error("Invalid data format. Patient ID and symptoms array required.");
+        }
+
+        // Map CSV rows to database schema with "Positive Default" values
+        const symptomRows = symptoms.map(row => {
+            // Helper to clean and provide a positive default (8/10) if value is missing
+            const val = (v) => {
+                const parsed = parseInt(v);
+                return isNaN(parsed) ? 8 : parsed; // Defaulting to 8 (Positive/Healthy)
+            };
+
+            return {
+                patient_id: patientId,
+                // Ensure date format is YYYY-MM-DD
+                date: row.date || new Date().toISOString().split('T')[0],
+                energy: val(row.energy),
+                sleep: val(row.sleep),
+                mood: val(row.mood),
+                stress: val(row.stress),
+                joint_pain: val(row.joint_pain)
+            };
+        });
+
+        // Insert into Supabase
+        const { error } = await supabase
+            .from('symptoms')
+            .insert(symptomRows);
+
+        if (error) throw error;
+
+        res.status(200).json({ 
+            success: true, 
+            message: `${symptomRows.length} symptom records imported with defaults.` 
+        });
+
+    } catch (err) {
+        console.error("❌ SYMPTOM IMPORT ERROR:", err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 module.exports = router;

@@ -6,7 +6,7 @@ const patientRoutes = require('./routes/patient');
 const app = express();
 
 // Middleware
-app.use(cors()); // Allows React to talk to Express
+app.use(cors({methods: ['GET', 'POST', 'PUT', 'DELETE']})); // Allows React to talk to Express
 app.use(express.json()); // Parses the data you send from React
 
 // Routes
@@ -16,6 +16,7 @@ app.use('/api/patient', patientRoutes);
 app.get('/', (req, res) => res.send('Allvi Server is Running!'));
 
 const PORT = 5000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server started on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server is live at http://localhost:${PORT}`);
+    console.log(`🚀 Also reachable at http://127.0.0.1:${PORT}`);
 });
