@@ -52,7 +52,7 @@ const getTallyAnswer = (responses, qid) => {
 router.post('/login', async (req, res) => {
     // 1. Clean the input from the frontend
     const inputId = req.body.allviId ? req.body.allviId.trim() : '';
-    
+
     console.log(`🔍 Attempting login for cleaned ID: [${inputId}]`);
 
     try {
@@ -61,7 +61,7 @@ router.post('/login', async (req, res) => {
             .select('*')
             // Using .ilike for case-insensitivity
             // Adding % trims allows it to find the ID even if there are hidden spaces in the DB
-            .ilike('allvi_id', `%${inputId}%`) 
+            .ilike('allvi_id', `%${inputId}%`)
             .maybeSingle();
 
         if (error) {
@@ -89,12 +89,12 @@ router.put('/profile/update/:allviId', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('patients')
-            .update({ 
-                name, 
-                email, 
-                age: parseInt(age), 
-                gender, 
-                city 
+            .update({
+                name,
+                email,
+                age: parseInt(age),
+                gender,
+                city
             })
             .eq('allvi_id', allviId)
             .select();
@@ -304,7 +304,7 @@ router.get('/insights/:patientId', async (req, res) => {
 
         const dataSummary = `Patient Lab History: ${JSON.stringify(labs)} Patient Symptom History: ${JSON.stringify(symptoms)}`;
         const prompt = `You are a clinical data analyst. Analyze this patient's health data and provide a structured summary in three sections: POSITIVE TRENDS, AREAS OF CONCERN, NEEDS ATTENTION.`;
-        
+
         const result = await model.generateContent([prompt, dataSummary]);
         res.status(200).json({ success: true, insights: result.response.text() });
     } catch (err) { res.status(500).json({ success: false, error: err.message }); }
@@ -312,17 +312,29 @@ router.get('/insights/:patientId', async (req, res) => {
 
 router.get('/admin/patients', async (req, res) => {
     try {
-        const { data: patients, error } = await supabase.from('patients').select(`allvi_id, created_at, lab_results (test_date)`);
+        // Fetch all patients and their latest lab result date
+        const { data: patients, error } = await supabase
+            .from('patients')
+            .select(`
+                allvi_id,
+                created_at,
+                lab_results (test_date)
+            `);
         if (error) throw error;
+        // Simplify data: find the most recent test date for each patien
         const formattedPatients = patients.map(p => ({
             id: p.allvi_id,
             joined: p.created_at,
-            lastActivity: p.lab_results?.length > 0 ? p.lab_results.sort((a, b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date : 'No reports yet'
+            lastActivity: p.lab_results?.length > 0
+                ? p.lab_results.sort((a, b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date
+                : 'No reports yet'
         }));
         res.status(200).json({ success: true, patients: formattedPatients });
-    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
-});
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 
+});
 router.delete('/admin/patients/:patientId', async (req, res) => {
     try {
         const { error } = await supabase.from('patients').delete().eq('allvi_id', req.params.patientId);
