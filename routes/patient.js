@@ -2,6 +2,7 @@ const express = require('express');
 const nodemailer = require('nodemailer');
 const router = express.Router();
 const multer = require('multer');
+const axios = require('axios'); // Ensure axios is installed
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require('@supabase/supabase-js');
@@ -18,6 +19,93 @@ const model = genAI.getGenerativeModel(
     { apiVersion: "v1beta" }
 );
 
+// --- NEW UPDATE: TALLY CONFIGURATION & MAPPING ---
+const TALLY_API_KEY = process.env.TALLY_API_KEY;
+const FORM_ID = 'zxYlVZ';
+
+const TALLY_MAP = {
+    NAME: "QA2rQg",
+    EMAIL: "9dG1kG",
+    GENDER: "aBNxL9",
+    CITY: "7dlDAL",
+    SYMPTOMS: "YZDOAd",
+    GOALS: "42Xkbb",
+    DOB: "WA9oWJ"
+};
+
+// Helper: Extract answer from Tally responses array
+const getTallyAnswer = (responses, qid) => {
+    const found = responses.find(r => r.questionId === qid);
+    if (!found) return null;
+    return Array.isArray(found.answer) ? found.answer[0] : found.answer;
+};
+
+// --- NEW UPDATE: LOGIN ROUTE ---
+// routes/patient.js
+
+// ✅ CORRECT: Just '/login'
+// --- NEW UPDATE: LOGIN ROUTE ---
+// routes/patient.js
+
+// routes/patient.js
+
+router.post('/login', async (req, res) => {
+    // 1. Clean the input from the frontend
+    const inputId = req.body.allviId ? req.body.allviId.trim() : '';
+    
+    console.log(`🔍 Attempting login for cleaned ID: [${inputId}]`);
+
+    try {
+        const { data: patient, error } = await supabase
+            .from('patients')
+            .select('*')
+            // Using .ilike for case-insensitivity
+            // Adding % trims allows it to find the ID even if there are hidden spaces in the DB
+            .ilike('allvi_id', `%${inputId}%`) 
+            .maybeSingle();
+
+        if (error) {
+            console.error("❌ Supabase Database Error:", error.message);
+            return res.status(500).json({ success: false, message: "Database error" });
+        }
+
+        if (!patient) {
+            console.log("⚠️ No patient record matched that ID string.");
+            return res.status(401).json({ success: false, message: "Invalid ALLVI ID" });
+        }
+
+        console.log("✅ Match found:", patient.name);
+        res.status(200).json({ success: true, patient });
+
+    } catch (err) {
+        console.error("❌ Server Error:", err.message);
+        res.status(500).json({ success: false, error: "Internal server error" });
+    }
+});
+// --- NEW UPDATE: PROFILE UPDATE ROUTE ---
+router.put('/profile/update/:allviId', async (req, res) => {
+    const { allviId } = req.params;
+    const { name, email, age, gender, city } = req.body;
+    try {
+        const { data, error } = await supabase
+            .from('patients')
+            .update({ 
+                name, 
+                email, 
+                age: parseInt(age), 
+                gender, 
+                city 
+            })
+            .eq('allvi_id', allviId)
+            .select();
+
+        if (error) throw error;
+        res.status(200).json({ success: true, message: "Profile updated successfully", data });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // Helper Function to Validate Date
 const isValidDate = (dateString) => {
     const regEx = /^\d{4}-\d{2}-\d{2}$/;
@@ -27,7 +115,6 @@ const isValidDate = (dateString) => {
 };
 
 // --- ROUTE: PROCESS REPORT ---
-// --- ROUTE: PROCESS REPORT (Dynamic Extraction) ---
 router.post('/process-report', upload.single('report'), async (req, res) => {
     let finalAllviId = req.body.existingId;
     const userAge = req.body.age;
@@ -36,11 +123,9 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
     const userName = req.body.name;
     const userCity = req.body.city;
 
-
     try {
         if (!req.file) throw new Error("No file uploaded");
 
-        // Force the AI to use a key-value structure that our dynamic frontend can loop through
         const prompt = `
             ACT AS: A clinical data extraction engine.
             TASK: Extract every lab result from the provided document.
@@ -78,9 +163,6 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
         ]);
 
         const text = result.response.text();
-
-        // --- 1. ROBUST CLEANING ---
-        // Removes markdown blocks and extra whitespace
         const cleanJson = text.replace(/```json|```/g, "").trim();
         let parsedData;
         try {
@@ -90,8 +172,6 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
             throw new Error("Could not parse lab data. Please try a clearer photo.");
         }
 
-        // --- 2. IDENTITY MANAGEMENT ---
-        // Ensure we don't pass the string "null" or "undefined" to Supabase
         const isNewPatient = !finalAllviId || finalAllviId === "null" || finalAllviId === "undefined";
 
         if (isNewPatient) {
@@ -100,15 +180,13 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
                 allvi_id: finalAllviId,
                 age: userAge ? parseInt(userAge) : null,
                 gender: userGender,
-                name : userName,
+                name: userName,
                 city: userCity,
                 email: userMail
             }]);
             if (patientErr) throw patientErr;
         }
 
-        // --- 3. DATA NORMALIZATION ---
-        // Ensures the frontend always receives the structure: { test_date, biomarkers: {} }
         const responsePayload = {
             test_date: parsedData.test_date || new Date().toISOString().split('T')[0],
             biomarkers: parsedData.biomarkers || {}
@@ -127,18 +205,15 @@ router.post('/process-report', upload.single('report'), async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
 // --- ROUTE: CONFIRM RESULTS ---
 router.post('/confirm-results', async (req, res) => {
     try {
         const { patientId, test_date, biomarkers } = req.body;
-        console.log(biomarkers)
-
-        // Store the entire 'biomarkers' object into a single JSONB column
         const { error } = await supabase.from('lab_results').insert([{
             patient_id: patientId,
             test_date: test_date || new Date().toISOString().split('T')[0],
             data: biomarkers
-            // This 'data' column in Supabase should be type JSONB
         }]);
 
         if (error) throw error;
@@ -149,23 +224,18 @@ router.post('/confirm-results', async (req, res) => {
     }
 });
 
-
 // --- UPDATED GET DASHBOARD DATA ---
 router.get('/dashboard/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
-        console.log("📊 Fetching dynamic clinical profile for:", patientId);
-
-        // 1. Fetch Patient Demographics
         const { data: patient, error: pErr } = await supabase
             .from('patients')
-            .select('age, gender')
+            .select('*')
             .eq('allvi_id', patientId)
             .single();
 
         if (pErr) console.error("⚠️ Demographics not found:", pErr.message);
 
-        // 2. Fetch Lab Results (Dynamic JSONB)
         const { data: labs, error: labErr } = await supabase
             .from('lab_results')
             .select('id, test_date, data, report_type')
@@ -174,8 +244,6 @@ router.get('/dashboard/:patientId', async (req, res) => {
 
         if (labErr) throw labErr;
 
-        // 3. THE FIX: Proper Flattening for Recharts + Metadata for UI
-        // Inside your GET /dashboard/:patientId route
         const formattedLabs = labs.map(row => {
             const transformedRow = {
                 id: row.id,
@@ -185,10 +253,8 @@ router.get('/dashboard/:patientId', async (req, res) => {
 
             if (row.data) {
                 Object.entries(row.data).forEach(([key, info]) => {
-                    // FORCE CONVERSION TO NUMBER
                     const val = parseFloat(info.value);
                     transformedRow[key] = isNaN(val) ? 0 : val;
-
                     transformedRow.meta[key] = {
                         label: info.label || key,
                         unit: info.unit || '',
@@ -199,19 +265,20 @@ router.get('/dashboard/:patientId', async (req, res) => {
             return transformedRow;
         });
 
-        // 4. Fetch Symptom Data
-        const { data: symptoms, error: sympErr } = await supabase
+        const { data: symptoms } = await supabase
             .from('symptoms')
             .select('*')
             .eq('patient_id', patientId)
             .order('date', { ascending: true });
 
-        // 5. Send Combined Response
         res.status(200).json({
             success: true,
             profile: {
+                name: patient?.name || '—',
+                email: patient?.email || '—',
                 age: patient?.age || '—',
                 gender: patient?.gender || '—',
+                city: patient?.city || '—',
                 allvi_id: patientId
             },
             labs: formattedLabs,
@@ -224,175 +291,135 @@ router.get('/dashboard/:patientId', async (req, res) => {
     }
 });
 
+// --- REMAINING ROUTES: INSIGHTS, ADMIN, IMPORT SYMPTOMS, APPOINTMENT ---
 router.get('/insights/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
-
-        // 1. Fetch the full history
         const { data: labs } = await supabase.from('lab_results').select('*').eq('patient_id', patientId).order('test_date', { ascending: true });
         const { data: symptoms } = await supabase.from('symptoms').select('*').eq('patient_id', patientId).order('date', { ascending: true });
 
         if (!labs || labs.length === 0) {
-            return res.json({ success: true, insights: "Not enough data to generate insights yet. Please upload more reports." });
+            return res.json({ success: true, insights: "Not enough data yet." });
         }
 
-        // 2. Format data for the AI
-        const dataSummary = `
-            Patient Lab History: ${JSON.stringify(labs)}
-            Patient Symptom History: ${JSON.stringify(symptoms)}
-        `;
-
-        // 3. Generate AI Insights
-        const prompt = `
-            You are a clinical data analyst. Analyze this patient's health data and provide a structured summary in exactly three sections. 
-            Keep it professional, clear, and bulleted.
-            
-            1. POSITIVE TRENDS: What is improving or stable?
-            2. AREAS OF CONCERN: What markers are trending outside normal ranges or symptoms worsening?
-            3. NEEDS ATTENTION: What patterns suggest a clinical review or lifestyle change?
-            
-            Return ONLY the summary. No preamble. Use Markdown.
-        `;
-
+        const dataSummary = `Patient Lab History: ${JSON.stringify(labs)} Patient Symptom History: ${JSON.stringify(symptoms)}`;
+        const prompt = `You are a clinical data analyst. Analyze this patient's health data and provide a structured summary in three sections: POSITIVE TRENDS, AREAS OF CONCERN, NEEDS ATTENTION.`;
+        
         const result = await model.generateContent([prompt, dataSummary]);
-        const insights = result.response.text();
-
-        res.status(200).json({ success: true, insights });
-    } catch (err) {
-        console.error("❌ INSIGHTS ERROR:", err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
+        res.status(200).json({ success: true, insights: result.response.text() });
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 router.get('/admin/patients', async (req, res) => {
     try {
-        // Fetch all patients and their latest lab result date
-        const { data: patients, error } = await supabase
-            .from('patients')
-            .select(`
-                allvi_id,
-                created_at,
-                lab_results (test_date)
-            `);
-
+        const { data: patients, error } = await supabase.from('patients').select(`allvi_id, created_at, lab_results (test_date)`);
         if (error) throw error;
-
-        // Simplify data: find the most recent test date for each patient
         const formattedPatients = patients.map(p => ({
             id: p.allvi_id,
             joined: p.created_at,
-            lastActivity: p.lab_results?.length > 0
-                ? p.lab_results.sort((a, b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date
-                : 'No reports yet'
+            lastActivity: p.lab_results?.length > 0 ? p.lab_results.sort((a, b) => new Date(b.test_date) - new Date(a.test_date))[0].test_date : 'No reports yet'
         }));
-
         res.status(200).json({ success: true, patients: formattedPatients });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// --- ADMIN: DELETE PATIENT AND ALL DATA ---
 router.delete('/admin/patients/:patientId', async (req, res) => {
     try {
-        const { patientId } = req.params;
-
-        // Deleting from the 'patients' table triggers a cascade delete
-        // for 'lab_results' and 'symptoms' in Supabase.
-        const { error } = await supabase
-            .from('patients')
-            .delete()
-            .eq('allvi_id', patientId);
-
+        const { error } = await supabase.from('patients').delete().eq('allvi_id', req.params.patientId);
         if (error) throw error;
-
-        res.status(200).json({
-            success: true,
-            message: `Patient ${patientId} and all associated records deleted.`
-        });
-    } catch (err) {
-        console.error("❌ DELETE ERROR:", err.message);
-        res.status(500).json({ success: false, error: err.message });
-    }
+        res.status(200).json({ success: true, message: "Deleted" });
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-// --- ROUTE: IMPORT SYMPTOMS (CSV Tally Data) ---
 router.post('/import-symptoms', async (req, res) => {
     try {
         const { patientId, symptoms } = req.body;
+        const symptomRows = symptoms.map(row => ({
+            patient_id: patientId,
+            date: row.date || new Date().toISOString().split('T')[0],
+            energy: parseInt(row.energy) || 8,
+            sleep: parseInt(row.sleep) || 8,
+            mood: parseInt(row.mood) || 8,
+            stress: parseInt(row.stress) || 8,
+            joint_pain: parseInt(row.joint_pain) || 8
+        }));
+        const { error } = await supabase.from('symptoms').insert(symptomRows);
+        if (error) throw error;
+        res.status(200).json({ success: true, message: "Imported" });
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
 
-        if (!patientId || !Array.isArray(symptoms)) {
-            throw new Error("Invalid data format. Patient ID and symptoms array required.");
+router.post('/request-appointment', async (req, res) => {
+    try {
+        const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS } });
+        await transporter.sendMail({ from: process.env.EMAIL_USER, to: 'support@allvihealth.com', subject: `Appointment: ${req.body.patientId}`, text: req.body.notes });
+        res.status(200).json({ success: true });
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// --- SYNC PAST TALLY DATA ROUTE (Using the ID Mapping) ---
+// --- SYNC PAST TALLY DATA ROUTE ---
+router.get('/sync-past-tally', async (req, res) => {
+    try {
+        console.log("🔄 Starting Tally Sync...");
+        const response = await axios.get(`https://api.tally.so/forms/${FORM_ID}/submissions`, {
+            headers: { 'Authorization': `Bearer ${TALLY_API_KEY}` }
+        });
+
+        const submissions = response.data.submissions;
+        if (!submissions || submissions.length === 0) {
+            return res.status(200).json({ success: true, message: "No submissions found in Tally." });
         }
 
-        // Map CSV rows to database schema with "Positive Default" values
-        const symptomRows = symptoms.map(row => {
-            // Helper to clean and provide a positive default (8/10) if value is missing
-            const val = (v) => {
-                const parsed = parseInt(v);
-                return isNaN(parsed) ? 8 : parsed; // Defaulting to 8 (Positive/Healthy)
-            };
+        let count = 0;
+        for (const sub of submissions) {
+            const resps = sub.responses;
 
-            return {
-                patient_id: patientId,
-                // Ensure date format is YYYY-MM-DD
-                date: row.date || new Date().toISOString().split('T')[0],
-                energy: val(row.energy),
-                sleep: val(row.sleep),
-                mood: val(row.mood),
-                stress: val(row.stress),
-                joint_pain: val(row.joint_pain)
-            };
-        });
+            // Extract values using your TALLY_MAP IDs
+            const email = getTallyAnswer(resps, TALLY_MAP.EMAIL);
+            const name = getTallyAnswer(resps, TALLY_MAP.NAME);
+            const gender = getTallyAnswer(resps, TALLY_MAP.GENDER);
+            const city = getTallyAnswer(resps, TALLY_MAP.CITY);
 
-        // Insert into Supabase
-        const { error } = await supabase
-            .from('symptoms')
-            .insert(symptomRows);
+            // CRITICAL CHECK: If Tally doesn't have an email, Supabase might reject it
+            if (!email) {
+                console.warn(`⚠️ Skipping submission ${sub.id}: No email found.`);
+                continue;
+            }
 
-        if (error) throw error;
+            // Generate the ID that the user will use to log in
+            const allvi_id = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
 
-        res.status(200).json({
-            success: true,
-            message: `${symptomRows.length} symptom records imported with defaults.`
-        });
+            // 1. Insert/Update Patient
+            const { error: pError } = await supabase.from('patients').upsert([{
+                allvi_id,
+                name: name || 'Unknown Patient',
+                email: email.toLowerCase().trim(),
+                gender: Array.isArray(gender) ? gender[0] : gender,
+                city: city,
+                created_at: sub.createdAt
+            }], { onConflict: 'email' });
 
+            if (pError) {
+                console.error(`❌ Supabase Patient Error (${email}):`, pError.message);
+                continue;
+            }
+
+            // 2. Insert Intake Data
+            await supabase.from('patient_intake').insert([{
+                patient_id: allvi_id,
+                symptoms: getTallyAnswer(resps, TALLY_MAP.SYMPTOMS),
+                goals: getTallyAnswer(resps, TALLY_MAP.GOALS)
+            }]);
+
+            count++;
+            console.log(`✅ Successfully synced: ${email} as ${allvi_id}`);
+        }
+
+        res.status(200).json({ success: true, message: `Successfully synced ${count} records.` });
     } catch (err) {
-        console.error("❌ SYMPTOM IMPORT ERROR:", err.message);
+        console.error("❌ Tally API Error:", err.response?.data || err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
-
-
-
-router.post('/request-appointment', async (req, res) => {
-    const { patientId, notes } = req.body;
-
-    try {
-        // Configure your email provider (Gmail, Outlook, SendGrid, etc.)
-        const transporter = nodemailer.createTransport({
-            service: 'gmail', 
-            auth: {
-                user: process.env.EMAIL_USER,
-                pass: process.env.EMAIL_PASS
-            }
-        });
-
-        const mailOptions = {
-            from: process.env.EMAIL_USER,
-            to: 'support@allvihealth.com',
-            subject: `Appointment Request: ${patientId}`,
-            text: `Patient ID: ${patientId}\n\nNotes from Patient:\n${notes || "No notes provided."}`
-        };
-
-        await transporter.sendMail(mailOptions);
-        res.status(200).json({ success: true, message: "Request sent successfully" });
-    } catch (error) {
-        console.error("Email Error:", error);
-        res.status(500).json({ success: false, error: "Failed to send request" });
-    }
-});
-
-
-
 module.exports = router;
