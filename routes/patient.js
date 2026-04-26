@@ -386,6 +386,7 @@ router.get('/sync-past-tally', async (req, res) => {
         let count = 0;
         for (const sub of submissions) {
             const resps = sub.responses;
+            
 
             // Extract values using your TALLY_MAP IDs
             const email = getTallyAnswer(resps, TALLY_MAP.EMAIL);
@@ -426,9 +427,10 @@ router.get('/sync-past-tally', async (req, res) => {
 
             count++;
             console.log(`✅ Successfully synced: ${email} as ${allvi_id}`);
+        
         }
 
-        res.status(200).json({ success: true, message: `Successfully synced ${count} records.` });
+        res.status(200).json({ success: true, message: `Successfully synced ${count} records.`});
     } catch (err) {
         console.error("❌ Tally API Error:", err.response?.data || err.message);
         res.status(500).json({ success: false, error: err.message });
