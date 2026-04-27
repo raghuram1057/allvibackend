@@ -114,6 +114,79 @@ const isValidDate = (dateString) => {
     return d instanceof Date && !isNaN(d.getTime());
 };
 
+// --- NEW ROUTE: DIRECT FORM SUBMISSION FROM FRONTEND ---
+router.post('/submit-intake', async (req, res) => {
+    try {
+        const formData = req.body;
+
+        // 1. Generate a new ALLVI ID
+        const allvi_id = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
+
+        // 2. Calculate age from Date of Birth (DOB)
+        let age = null;
+        if (formData.dob) {
+            const birthDate = new Date(formData.dob);
+            const difference = Date.now() - birthDate.getTime();
+            age = Math.floor(difference / (1000 * 60 * 60 * 24 * 365.25));
+        }
+
+        // 3. Map gender to match your DB CHECK constraint: ['Male', 'Female', 'Other']
+        let safeGender = 'Other'; 
+        if (formData.gender === 'Male' || formData.gender === 'Female') {
+            safeGender = formData.gender;
+        }
+
+        // 4. Insert into the `patients` table
+        const { error: patientErr } = await supabase.from('patients').insert([{
+            allvi_id: allvi_id,
+            name: formData.fullName || 'Unknown',
+            email: formData.email ? formData.email.toLowerCase().trim() : null,
+            gender: safeGender,
+            city: formData.location,
+            age: age
+        }]);
+
+        if (patientErr) throw patientErr;
+
+        // 5. Consolidate Symptoms & Diagnoses for the `patient_intake` table
+        // We flatten all the symptom arrays from step 2 into a single array
+        const allSymptoms = [
+            ...formData.symptomsEnergy,
+            ...formData.symptomsDigestion,
+            ...formData.symptomsMental,
+            ...formData.symptomsSleep,
+            ...formData.symptomsOther
+        ];
+        if (formData.symptomsOtherText) allSymptoms.push(`Other: ${formData.symptomsOtherText}`);
+
+        // Consolidate diagnoses
+        const allDiagnoses = [...formData.conditions];
+        if (formData.conditionOther) allDiagnoses.push(`Other: ${formData.conditionOther}`);
+
+        // 6. Insert into `patient_intake` table
+        const { error: intakeErr } = await supabase.from('patient_intake').insert([{
+            patient_id: allvi_id,
+            diagnoses: allDiagnoses,   // Maps to text[]
+            symptoms: allSymptoms,     // Maps to text[]
+            goals: formData.topGoals,  // Maps to text
+            stated_concern: formData.topHelp + (formData.anythingElse ? ` | Extra Notes: ${formData.anythingElse}` : '')
+        }]);
+
+        if (intakeErr) {
+            // If intake fails, log it, but the user is already created
+            console.error("⚠️ Intake insertion failed:", intakeErr.message);
+            throw intakeErr; 
+        }
+
+        console.log(`✅ Direct form submission successful for: ${allvi_id}`);
+        res.status(200).json({ success: true, allvi_id, message: "Intake form submitted successfully!" });
+
+    } catch (err) {
+        console.error("❌ SUBMIT INTAKE ERROR:", err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // --- ROUTE: PROCESS REPORT ---
 router.post('/process-report', upload.single('report'), async (req, res) => {
     let finalAllviId = req.body.existingId;
@@ -371,69 +444,126 @@ router.post('/request-appointment', async (req, res) => {
 
 // --- SYNC PAST TALLY DATA ROUTE (Using the ID Mapping) ---
 // --- SYNC PAST TALLY DATA ROUTE ---
+// Step 3: Fixed sync route that matches your Supabase schema correctly
 router.get('/sync-past-tally', async (req, res) => {
     try {
-        console.log("🔄 Starting Tally Sync...");
         const response = await axios.get(`https://api.tally.so/forms/${FORM_ID}/submissions`, {
             headers: { 'Authorization': `Bearer ${TALLY_API_KEY}` }
         });
 
         const submissions = response.data.submissions;
-        if (!submissions || submissions.length === 0) {
-            return res.status(200).json({ success: true, message: "No submissions found in Tally." });
+        if (!submissions?.length) {
+            return res.status(200).json({ success: true, message: "No submissions found." });
         }
 
-        let count = 0;
+        let synced = 0;
+        let skipped = 0;
+        const errors = [];
+
         for (const sub of submissions) {
             const resps = sub.responses;
-            
 
-            // Extract values using your TALLY_MAP IDs
+            // Extract fields using corrected TALLY_MAP
             const email = getTallyAnswer(resps, TALLY_MAP.EMAIL);
-            const name = getTallyAnswer(resps, TALLY_MAP.NAME);
-            const gender = getTallyAnswer(resps, TALLY_MAP.GENDER);
-            const city = getTallyAnswer(resps, TALLY_MAP.CITY);
+            const name  = getTallyAnswer(resps, TALLY_MAP.NAME);
+            const city  = getTallyAnswer(resps, TALLY_MAP.CITY);
+            const symptoms = getTallyAnswer(resps, TALLY_MAP.SYMPTOMS); // text or array
+            const goals    = getTallyAnswer(resps, TALLY_MAP.GOALS);
 
-            // CRITICAL CHECK: If Tally doesn't have an email, Supabase might reject it
+            // Gender: Tally sometimes returns array for multiple choice
+            let gender = getTallyAnswer(resps, TALLY_MAP.GENDER);
+            if (Array.isArray(gender)) gender = gender[0];
+
+            // Validate against your schema's CHECK constraint
+            const validGenders = ['Male', 'Female', 'Other'];
+            const safeGender = validGenders.includes(gender) ? gender : null;
+
             if (!email) {
-                console.warn(`⚠️ Skipping submission ${sub.id}: No email found.`);
+                console.warn(`⚠️ Skipping ${sub.id}: no email`);
+                skipped++;
                 continue;
             }
 
-            // Generate the ID that the user will use to log in
             const allvi_id = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
 
-            // 1. Insert/Update Patient
-            const { error: pError } = await supabase.from('patients').upsert([{
-                allvi_id,
-                name: name || 'Unknown Patient',
-                email: email.toLowerCase().trim(),
-                gender: Array.isArray(gender) ? gender[0] : gender,
-                city: city,
-                created_at: sub.createdAt
-            }], { onConflict: 'email' });
+            // --- Insert Patient (schema: patients table) ---
+            // onConflict: 'email' — updates existing patient if email already exists
+            const { data: patientData, error: pError } = await supabase
+                .from('patients')
+                .upsert([{
+                    allvi_id,
+                    name:   name  || 'Unknown',
+                    email:  email.toLowerCase().trim(),
+                    gender: safeGender,
+                    city:   city  || null,
+                    created_at: sub.createdAt
+                }], { onConflict: 'email' })
+                .select('allvi_id')  // get back the actual allvi_id (may differ if row existed)
+                .single();
 
             if (pError) {
-                console.error(`❌ Supabase Patient Error (${email}):`, pError.message);
+                console.error(`❌ Patient upsert failed (${email}):`, pError.message);
+                errors.push({ email, error: pError.message });
                 continue;
             }
 
-            // 2. Insert Intake Data
-            await supabase.from('patient_intake').insert([{
-                patient_id: allvi_id,
-                symptoms: getTallyAnswer(resps, TALLY_MAP.SYMPTOMS),
-                goals: getTallyAnswer(resps, TALLY_MAP.GOALS)
-            }]);
+            // Use the DB's actual allvi_id (important when row already existed)
+            const actualAllviId = patientData.allvi_id;
 
-            count++;
-            console.log(`✅ Successfully synced: ${email} as ${allvi_id}`);
-        
+            // --- Insert Intake (schema: patient_intake table) ---
+            // symptoms column is ARRAY type in your schema
+            const symptomsArray = Array.isArray(symptoms)
+                ? symptoms
+                : (symptoms ? [symptoms] : []);  // wrap string in array
+
+            const { error: intakeError } = await supabase
+                .from('patient_intake')
+                .insert([{
+                    patient_id: actualAllviId,
+                    symptoms:   symptomsArray,   // text[] in schema
+                    goals:      goals || null,   // text in schema
+                }]);
+
+            if (intakeError) {
+                // Non-fatal: log but don't skip
+                console.warn(`⚠️ Intake insert failed (${actualAllviId}):`, intakeError.message);
+            }
+
+            synced++;
+            console.log(`✅ Synced: ${email} → ${actualAllviId}`);
         }
 
-        res.status(200).json({ success: true, message: `Successfully synced ${count} records.`});
+        res.status(200).json({
+            success: true,
+            message: `Synced ${synced}, skipped ${skipped}`,
+            errors: errors.length ? errors : undefined
+        });
+
     } catch (err) {
-        console.error("❌ Tally API Error:", err.response?.data || err.message);
+        console.error("❌ Tally Sync Error:", err.response?.data || err.message);
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// Step 1: Add this debug route FIRST to see your real question IDs
+router.get('/debug-tally', async (req, res) => {
+    try {
+        const response = await axios.get(`https://api.tally.so/forms/${FORM_ID}/submissions`, {
+            headers: { 'Authorization': `Bearer ${TALLY_API_KEY}` }
+        });
+
+        const firstSub = response.data.submissions?.[0];
+        if (!firstSub) return res.json({ message: "No submissions" });
+
+        // Returns all questionIds + answers so you can build your map
+        const questionMap = firstSub.responses.map(r => ({
+            questionId: r.questionId,
+            answer: r.answer
+        }));
+
+        res.json({ questionMap });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 module.exports = router;
