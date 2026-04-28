@@ -301,14 +301,30 @@ router.post('/confirm-results', async (req, res) => {
 router.get('/dashboard/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
+
+        // 1. Fetch Patient Demographics
         const { data: patient, error: pErr } = await supabase
             .from('patients')
             .select('*')
             .eq('allvi_id', patientId)
-            .single();
+            .maybeSingle(); // maybeSingle prevents crashing if no user is found
 
         if (pErr) console.error("⚠️ Demographics not found:", pErr.message);
 
+        // 2. Fetch Latest Intake Form Data
+        const { data: intakeData, error: intakeErr } = await supabase
+            .from('patient_intake')
+            .select('*')
+            .eq('patient_id', patientId)
+            .order('updated_at', { ascending: false })
+            .limit(1); // Get the most recent intake form if there are multiple
+
+        if (intakeErr) console.error("⚠️ Intake form not found:", intakeErr.message);
+        
+        // Extract the single intake object (if it exists)
+        const intake = intakeData && intakeData.length > 0 ? intakeData[0] : null;
+
+        // 3. Fetch Lab Results
         const { data: labs, error: labErr } = await supabase
             .from('lab_results')
             .select('id, test_date, data, report_type')
@@ -317,6 +333,7 @@ router.get('/dashboard/:patientId', async (req, res) => {
 
         if (labErr) throw labErr;
 
+        // 4. Format Lab Results
         const formattedLabs = labs.map(row => {
             const transformedRow = {
                 id: row.id,
@@ -338,12 +355,23 @@ router.get('/dashboard/:patientId', async (req, res) => {
             return transformedRow;
         });
 
+        // 5. Fetch Time-Series Symptom Logs
         const { data: symptoms } = await supabase
             .from('symptoms')
             .select('*')
             .eq('patient_id', patientId)
             .order('date', { ascending: true });
 
+        // 6. ── NEW: Fetch Specialist Reviews ──
+        const { data: reviews, error: reviewsErr } = await supabase
+            .from('specialist_reviews')
+            .select('*')
+            .eq('patient_id', patientId)
+            .order('sent_at', { ascending: false }); // Newest reviews first
+
+        if (reviewsErr) console.error("⚠️ Specialist reviews error:", reviewsErr.message);
+
+        // 7. Return all data to the frontend
         res.status(200).json({
             success: true,
             profile: {
@@ -354,8 +382,10 @@ router.get('/dashboard/:patientId', async (req, res) => {
                 city: patient?.city || '—',
                 allvi_id: patientId
             },
+            intake: intake || {},
             labs: formattedLabs,
-            symptoms: symptoms || []
+            symptoms: symptoms || [],
+            specialistReviews: reviews || [] // <-- NEW: Array of specialist reviews added here!
         });
 
     } catch (err) {
@@ -363,26 +393,39 @@ router.get('/dashboard/:patientId', async (req, res) => {
         res.status(500).json({ success: false, details: err.message });
     }
 });
-
 // --- REMAINING ROUTES: INSIGHTS, ADMIN, IMPORT SYMPTOMS, APPOINTMENT ---
+// --- UPDATED ROUTE: GENERATE AI INSIGHTS ---
 router.get('/insights/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
+        
+        // 1. Fetch Labs, Symptoms, AND Intake Data
         const { data: labs } = await supabase.from('lab_results').select('*').eq('patient_id', patientId).order('test_date', { ascending: true });
         const { data: symptoms } = await supabase.from('symptoms').select('*').eq('patient_id', patientId).order('date', { ascending: true });
+        const { data: intake } = await supabase.from('patient_intake').select('*').eq('patient_id', patientId).order('updated_at', { ascending: false }).limit(1);
 
         if (!labs || labs.length === 0) {
-            return res.json({ success: true, insights: "Not enough data yet." });
+            return res.json({ success: true, insights: "Not enough clinical data yet to generate insights." });
         }
 
-        const dataSummary = `Patient Lab History: ${JSON.stringify(labs)} Patient Symptom History: ${JSON.stringify(symptoms)}`;
-        const prompt = `You are a clinical data analyst. Analyze this patient's health data and provide a structured summary in three sections: POSITIVE TRENDS, AREAS OF CONCERN, NEEDS ATTENTION.`;
+        // 2. Feed ALL data into the AI Context
+        const dataSummary = `
+            Patient Lab History: ${JSON.stringify(labs)}
+            Patient Symptom History: ${JSON.stringify(symptoms)}
+            Patient Intake Form (Goals, Conditions, Concerns): ${JSON.stringify(intake)}
+        `;
+
+        // 3. Prompt Gemini
+        const prompt = `You are a clinical data analyst. Analyze this patient's health data (including their intake goals, symptoms, and lab results). Provide a structured summary in three sections: POSITIVE TRENDS, AREAS OF CONCERN, and NEEDS ATTENTION. Keep it clinically precise.`;
 
         const result = await model.generateContent([prompt, dataSummary]);
+        
         res.status(200).json({ success: true, insights: result.response.text() });
-    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+    } catch (err) { 
+        console.error("AI Insights Error:", err.message);
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 });
-
 router.get('/admin/patients', async (req, res) => {
     try {
         // Fetch all patients and their latest lab result date
@@ -564,6 +607,52 @@ router.get('/debug-tally', async (req, res) => {
         res.json({ questionMap });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// --- ROUTE: SAVE SPECIALIST PROTOCOL & NOTES ---
+// --- 1. ROUTE: SAVE SPECIALIST PROTOCOL & NOTES (UPDATED FOR FILES & NEXT STEPS) ---
+router.post('/admin/send-protocol', upload.single('protocolFile'), async (req, res) => {
+    try {
+        const { patientId, notes, summary, nextStep, specialistName } = req.body;
+        let attachmentUrl = null;
+
+        // If a file was uploaded, save it to Supabase Storage
+        // NOTE: You must create a public bucket named 'protocols' in your Supabase dashboard!
+        if (req.file) {
+            const fileName = `${patientId}_${Date.now()}_${req.file.originalname.replace(/\s+/g, '_')}`;
+            const { data, error: uploadErr } = await supabase.storage
+                .from('protocols')
+                .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+
+            if (uploadErr) {
+                console.error("Storage upload error:", uploadErr.message);
+            } else {
+                // Get the public URL for the patient to download
+                const { data: publicUrlData } = supabase.storage.from('protocols').getPublicUrl(fileName);
+                attachmentUrl = publicUrlData.publicUrl;
+            }
+        }
+
+        const combinedMessage = summary && summary !== 'null' 
+            ? `${notes}\n\n=== AI SUMMARY REFERENCE ===\n${summary}`
+            : notes;
+
+        const { error } = await supabase.from('specialist_reviews').insert([{
+            patient_id: patientId,
+            message_text: combinedMessage,
+            reviewed_by: specialistName || 'Allvi Clinical Specialist',
+            next_step: nextStep || 'Follow up in 2 weeks',
+            protocol_attachment_url: attachmentUrl,
+            sent_at: new Date().toISOString()
+        }]);
+
+        if (error) throw error;
+
+        res.status(200).json({ success: true, message: "Protocol sent to patient successfully!" });
+    } catch (err) {
+        console.error("❌ SEND PROTOCOL ERROR:", err.message);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 module.exports = router;
