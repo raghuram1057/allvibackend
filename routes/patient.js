@@ -114,29 +114,34 @@ const isValidDate = (dateString) => {
     return d instanceof Date && !isNaN(d.getTime());
 };
 
-// --- NEW ROUTE: DIRECT FORM SUBMISSION FROM FRONTEND ---
-router.post('/submit-intake', async (req, res) => {
+// --- UPGRADED ROUTE: DIRECT FORM SUBMISSION + AI LAB EXTRACTION ---
+// Notice the 'upload.single('labReport')' middleware added here
+// --- UPGRADED ROUTE: DIRECT FORM SUBMISSION (Routes to Review Screen) ---
+router.post('/submit-intake', upload.single('labReport'), async (req, res) => {
     try {
-        const formData = req.body;
+        const parseArray = (field) => {
+            if (!field) return [];
+            if (typeof field === 'string') {
+                try { return JSON.parse(field); } catch (e) { return [field]; }
+            }
+            return Array.isArray(field) ? field : [field];
+        };
 
-        // 1. Generate a new ALLVI ID
+        const formData = req.body;
         const allvi_id = `ALLVI-${Math.floor(1000 + Math.random() * 9000)}`;
 
-        // 2. Calculate age from Date of Birth (DOB)
+        console.log(`🚀 Starting Intake for ${allvi_id}...`);
+
         let age = null;
         if (formData.dob) {
-            const birthDate = new Date(formData.dob);
-            const difference = Date.now() - birthDate.getTime();
+            const difference = Date.now() - new Date(formData.dob).getTime();
             age = Math.floor(difference / (1000 * 60 * 60 * 24 * 365.25));
         }
 
-        // 3. Map gender to match your DB CHECK constraint: ['Male', 'Female', 'Other']
         let safeGender = 'Other'; 
-        if (formData.gender === 'Male' || formData.gender === 'Female') {
-            safeGender = formData.gender;
-        }
+        if (formData.gender === 'Male' || formData.gender === 'Female') safeGender = formData.gender;
 
-        // 4. Insert into the `patients` table
+        // 1. Save Patient Info
         const { error: patientErr } = await supabase.from('patients').insert([{
             allvi_id: allvi_id,
             name: formData.fullName || 'Unknown',
@@ -145,48 +150,99 @@ router.post('/submit-intake', async (req, res) => {
             city: formData.location,
             age: age
         }]);
+        if (patientErr) throw new Error(`Patient Insert Error: ${patientErr.message}`);
 
-        if (patientErr) throw patientErr;
-
-        // 5. Consolidate Symptoms & Diagnoses for the `patient_intake` table
-        // We flatten all the symptom arrays from step 2 into a single array
+        // 2. Save Intake Form
         const allSymptoms = [
-            ...formData.symptomsEnergy,
-            ...formData.symptomsDigestion,
-            ...formData.symptomsMental,
-            ...formData.symptomsSleep,
-            ...formData.symptomsOther
+            ...parseArray(formData.symptomsEnergy), ...parseArray(formData.symptomsDigestion),
+            ...parseArray(formData.symptomsMental), ...parseArray(formData.symptomsSleep), ...parseArray(formData.symptomsOther)
         ];
         if (formData.symptomsOtherText) allSymptoms.push(`Other: ${formData.symptomsOtherText}`);
 
-        // Consolidate diagnoses
-        const allDiagnoses = [...formData.conditions];
+        const allDiagnoses = [...parseArray(formData.conditions)];
         if (formData.conditionOther) allDiagnoses.push(`Other: ${formData.conditionOther}`);
 
-        // 6. Insert into `patient_intake` table
         const { error: intakeErr } = await supabase.from('patient_intake').insert([{
-            patient_id: allvi_id,
-            diagnoses: allDiagnoses,   // Maps to text[]
-            symptoms: allSymptoms,     // Maps to text[]
-            goals: formData.topGoals,  // Maps to text
+            patient_id: allvi_id, diagnoses: allDiagnoses, symptoms: allSymptoms, goals: formData.topGoals,
             stated_concern: formData.topHelp + (formData.anythingElse ? ` | Extra Notes: ${formData.anythingElse}` : '')
         }]);
+        if (intakeErr) console.error("⚠️ Intake insertion failed:", intakeErr.message);
 
-        if (intakeErr) {
-            // If intake fails, log it, but the user is already created
-            console.error("⚠️ Intake insertion failed:", intakeErr.message);
-            throw intakeErr; 
+        // ====================================================================
+        // 3. NEW: AI LAB REPORT EXTRACTION PHASE (NO DB INSERT HERE!)
+        // ====================================================================
+        let extractionSuccess = false;
+        let parsedDataForReview = null;
+
+        if (req.file) {
+            console.log(`📄 Lab report detected. Sending to Gemini AI for extraction...`);
+            
+            const filePart = { inlineData: { data: req.file.buffer.toString("base64"), mimeType: req.file.mimetype } };
+            const prompt = `
+                ACT AS: A clinical data extraction engine.
+                TASK: Extract every lab result from the provided document.
+                REQUIRED JSON STRUCTURE:
+                {
+                  "test_date": "YYYY-MM-DD",
+                  "biomarkers": {
+                    "standardized_key": { "label": "Full Test Name", "value": 0.0, "unit": "string", "ref_range": "string" }
+                  }
+                }
+                INSTRUCTIONS:
+                1. "test_date": Locate the sample collection or report date.
+                2. "standardized_key": short, lowercase_underscored name (e.g., "vit_b12").
+                3. "label": Exact, formal test name.
+                4. "value": Extract ONLY the number.
+                5. "unit": Extract the measurement unit.
+                6. "ref_range": Extract the reference interval.
+                RULES: Identify EVERY marker. Return ONLY raw JSON. NO markdown.
+            `;
+
+            try {
+                const result = await model.generateContent([prompt, filePart]);
+                let aiText = result.response.text().replace(/```json/gi, '').replace(/```/g, '').trim();
+                const extractedData = JSON.parse(aiText);
+
+                const normalizedBiomarkers = {};
+                if (extractedData.biomarkers) {
+                    for (const [key, markerData] of Object.entries(extractedData.biomarkers)) {
+                        const numericValue = parseFloat(markerData.value);
+                        normalizedBiomarkers[key] = {
+                            ...markerData,
+                            value: isNaN(numericValue) ? markerData.value : numericValue
+                        };
+                    }
+                }
+
+                // 🚨 CRITICAL FIX: We do NOT insert into supabase.from('lab_results') here.
+                // Instead, we package it up exactly how Phase1Review expects it!
+                parsedDataForReview = {
+                    test_date: extractedData.test_date || new Date().toISOString().split('T')[0],
+                    biomarkers: normalizedBiomarkers
+                };
+                
+                extractionSuccess = true;
+                console.log(`✅ Lab data extracted and ready for Review screen!`);
+
+            } catch (aiErr) {
+                console.error("⚠️ AI Extraction failed.", aiErr.message);
+            }
         }
 
-        console.log(`✅ Direct form submission successful for: ${allvi_id}`);
-        res.status(200).json({ success: true, allvi_id, message: "Intake form submitted successfully!" });
+        // 4. Send back to RegisterPage.jsx
+        res.status(200).json({ 
+            success: true, 
+            allvi_id, 
+            extractedLabs: extractionSuccess,
+            parsedData: parsedDataForReview, // <-- Sent straight to the Review Page!
+            message: "Intake form submitted!" 
+        });
 
     } catch (err) {
         console.error("❌ SUBMIT INTAKE ERROR:", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
-
 // --- ROUTE: PROCESS REPORT ---
 router.post('/process-report', upload.single('report'), async (req, res) => {
     let finalAllviId = req.body.existingId;
@@ -301,100 +357,37 @@ router.post('/confirm-results', async (req, res) => {
 router.get('/dashboard/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
+        const { data: patient } = await supabase.from('patients').select('*').eq('allvi_id', patientId).maybeSingle();
+        const { data: intakeData } = await supabase.from('patient_intake').select('*').eq('patient_id', patientId).order('updated_at', { ascending: false }).limit(1);
+        const { data: labs } = await supabase.from('lab_results').select('id, test_date, data, report_type').eq('patient_id', patientId).order('test_date', { ascending: true });
+        const { data: symptoms } = await supabase.from('symptoms').select('*').eq('patient_id', patientId).order('date', { ascending: true });
+        const { data: reviews } = await supabase.from('specialist_reviews').select('*').eq('patient_id', patientId).order('sent_at', { ascending: false });
 
-        // 1. Fetch Patient Demographics
-        const { data: patient, error: pErr } = await supabase
-            .from('patients')
-            .select('*')
-            .eq('allvi_id', patientId)
-            .maybeSingle(); // maybeSingle prevents crashing if no user is found
-
-        if (pErr) console.error("⚠️ Demographics not found:", pErr.message);
-
-        // 2. Fetch Latest Intake Form Data
-        const { data: intakeData, error: intakeErr } = await supabase
-            .from('patient_intake')
-            .select('*')
-            .eq('patient_id', patientId)
-            .order('updated_at', { ascending: false })
-            .limit(1); // Get the most recent intake form if there are multiple
-
-        if (intakeErr) console.error("⚠️ Intake form not found:", intakeErr.message);
-        
-        // Extract the single intake object (if it exists)
-        const intake = intakeData && intakeData.length > 0 ? intakeData[0] : null;
-
-        // 3. Fetch Lab Results
-        const { data: labs, error: labErr } = await supabase
-            .from('lab_results')
-            .select('id, test_date, data, report_type')
-            .eq('patient_id', patientId)
-            .order('test_date', { ascending: true });
-
-        if (labErr) throw labErr;
-
-        // 4. Format Lab Results
-        const formattedLabs = labs.map(row => {
-            const transformedRow = {
-                id: row.id,
-                test_date: row.test_date,
-                meta: {}
-            };
-
+        const formattedLabs = (labs || []).map(row => {
+            const transformedRow = { id: row.id, test_date: row.test_date, meta: {} };
             if (row.data) {
                 Object.entries(row.data).forEach(([key, info]) => {
                     const val = parseFloat(info.value);
                     transformedRow[key] = isNaN(val) ? 0 : val;
-                    transformedRow.meta[key] = {
-                        label: info.label || key,
-                        unit: info.unit || '',
-                        ref_range: info.ref_range || ''
-                    };
+                    transformedRow.meta[key] = { label: info.label || key, unit: info.unit || '', ref_range: info.ref_range || '' };
                 });
             }
             return transformedRow;
         });
 
-        // 5. Fetch Time-Series Symptom Logs
-        const { data: symptoms } = await supabase
-            .from('symptoms')
-            .select('*')
-            .eq('patient_id', patientId)
-            .order('date', { ascending: true });
-
-        // 6. ── NEW: Fetch Specialist Reviews ──
-        const { data: reviews, error: reviewsErr } = await supabase
-            .from('specialist_reviews')
-            .select('*')
-            .eq('patient_id', patientId)
-            .order('sent_at', { ascending: false }); // Newest reviews first
-
-        if (reviewsErr) console.error("⚠️ Specialist reviews error:", reviewsErr.message);
-
-        // 7. Return all data to the frontend
         res.status(200).json({
             success: true,
-            profile: {
-                name: patient?.name || '—',
-                email: patient?.email || '—',
-                age: patient?.age || '—',
-                gender: patient?.gender || '—',
-                city: patient?.city || '—',
-                allvi_id: patientId
-            },
-            intake: intake || {},
+            profile: { ...patient, allvi_id: patientId },
+            intake: intakeData ? intakeData[0] : {},
             labs: formattedLabs,
             symptoms: symptoms || [],
-            specialistReviews: reviews || [] // <-- NEW: Array of specialist reviews added here!
+            specialistReviews: reviews || []
         });
-
-    } catch (err) {
-        console.error("❌ DASHBOARD DATA ERROR:", err.message);
-        res.status(500).json({ success: false, details: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, details: err.message }); }
 });
 // --- REMAINING ROUTES: INSIGHTS, ADMIN, IMPORT SYMPTOMS, APPOINTMENT ---
 // --- UPDATED ROUTE: GENERATE AI INSIGHTS ---
+// ─── 3. AI INSIGHTS GENERATION (CRASH-PROOF VERSION) ───
 router.get('/insights/:patientId', async (req, res) => {
     try {
         const { patientId } = req.params;
@@ -426,6 +419,7 @@ router.get('/insights/:patientId', async (req, res) => {
         res.status(500).json({ success: false, error: err.message }); 
     }
 });
+
 router.get('/admin/patients', async (req, res) => {
     try {
         // Fetch all patients and their latest lab result date
@@ -463,7 +457,7 @@ router.post('/import-symptoms', async (req, res) => {
     try {
         const { patientId, symptoms } = req.body;
         const symptomRows = symptoms.map(row => ({
-            patient_id: patientId,
+            patient_id: patientId, 
             date: row.date || new Date().toISOString().split('T')[0],
             energy: parseInt(row.energy) || 8,
             sleep: parseInt(row.sleep) || 8,

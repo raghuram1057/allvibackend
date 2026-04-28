@@ -8,6 +8,8 @@ const app = express();
 // Middleware
 app.use(cors({methods: ['GET', 'POST', 'PUT', 'DELETE']})); // Allows React to talk to Express
 app.use(express.json()); // Parses the data you send from React
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Routes
 app.use('/api/patient', patientRoutes);
